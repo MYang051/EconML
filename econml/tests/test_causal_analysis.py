@@ -45,8 +45,8 @@ class TestCausalAnalysis(unittest.TestCase):
                 loc_point_est = np.array(loc_dict[_CausalInsightsConstants.PointEstimateKey])
 
                 ca._policy_tree_output(X, 1)
-                ca._heterogeneity_tree_string(X, 1)
-                ca._heterogeneity_tree_string(X, 3)
+                ca._heterogeneity_tree_output(X, 1)
+                ca._heterogeneity_tree_output(X, 3)
 
                 # Can't handle multi-dimensional treatments
                 with self.assertRaises(AssertionError):
@@ -63,10 +63,8 @@ class TestCausalAnalysis(unittest.TestCase):
                 with cm:
                     inf = ca.whatif(X[:2], np.ones(shape=(2,)), 1, y[:2])
                     assert np.shape(inf.point_estimate) == np.shape(y[:2])
-                    inf.summary_frame()
                     inf = ca.whatif(X[:2], np.ones(shape=(2,)), 2, y[:2])
                     assert np.shape(inf.point_estimate) == np.shape(y[:2])
-                    inf.summary_frame()
 
                     ca._whatif_dict(X[:2], np.ones(shape=(2,)), 1, y[:2])
 
@@ -133,9 +131,9 @@ class TestCausalAnalysis(unittest.TestCase):
                 assert glo_point_est.shape == coh_point_est.shape == (1, 5)
                 assert loc_point_est.shape == (2,) + glo_point_est.shape
 
-                ca._policy_tree_output(X, inds[1])
-                ca._heterogeneity_tree_string(X, inds[1])
-                ca._heterogeneity_tree_string(X, inds[3])
+                pto = ca._policy_tree_output(X, inds[1])
+                ca._heterogeneity_tree_output(X, inds[1])
+                ca._heterogeneity_tree_output(X, inds[3])
 
                 # Can't handle multi-dimensional treatments
                 with self.assertRaises(AssertionError):
@@ -149,10 +147,8 @@ class TestCausalAnalysis(unittest.TestCase):
                 with cm:
                     inf = ca.whatif(X[:2], np.ones(shape=(2,)), inds[1], y[:2])
                     assert np.shape(inf.point_estimate) == np.shape(y[:2])
-                    inf.summary_frame()
                     inf = ca.whatif(X[:2], np.ones(shape=(2,)), inds[2], y[:2])
                     assert np.shape(inf.point_estimate) == np.shape(y[:2])
-                    inf.summary_frame()
 
                     ca._whatif_dict(X[:2], np.ones(shape=(2,)), inds[1], y[:2])
 
@@ -200,8 +196,8 @@ class TestCausalAnalysis(unittest.TestCase):
             loc_point_est = np.array(loc_dict[_CausalInsightsConstants.PointEstimateKey])
 
             ca._policy_tree_output(X, 1)
-            ca._heterogeneity_tree_string(X, 1)
-            ca._heterogeneity_tree_string(X, 3)
+            ca._heterogeneity_tree_output(X, 1)
+            ca._heterogeneity_tree_output(X, 3)
 
             # Can't handle multi-dimensional treatments
             with self.assertRaises(AssertionError):
@@ -280,7 +276,7 @@ class TestCausalAnalysis(unittest.TestCase):
         assert loc_point_est.shape == (2,) + glo_point_est.shape
 
         ca._policy_tree_output(X, inds[0])
-        ca._heterogeneity_tree_string(X, inds[0])
+        ca._heterogeneity_tree_output(X, inds[0])
 
     def test_final_models(self):
         d_y = (1,)
@@ -303,8 +299,8 @@ class TestCausalAnalysis(unittest.TestCase):
                 loc_dict = ca._local_causal_effect_dict(X[:2])
 
                 ca._policy_tree_output(X, 1)
-                ca._heterogeneity_tree_string(X, 1)
-                ca._heterogeneity_tree_string(X, 3)
+                ca._heterogeneity_tree_output(X, 1)
+                ca._heterogeneity_tree_output(X, 3)
 
                 # Can't handle multi-dimensional treatments
                 with self.assertRaises(AssertionError):
@@ -371,8 +367,8 @@ class TestCausalAnalysis(unittest.TestCase):
         assert loc_point_est.shape == (2,) + glo_point_est.shape
 
         ca._policy_tree_output(X, inds[1])
-        ca._heterogeneity_tree_string(X, inds[1])
-        ca._heterogeneity_tree_string(X, inds[3])
+        ca._heterogeneity_tree_output(X, inds[1])
+        ca._heterogeneity_tree_output(X, inds[3])
 
         # Can't handle multi-dimensional treatments
         with self.assertRaises(AssertionError):
@@ -481,3 +477,30 @@ class TestCausalAnalysis(unittest.TestCase):
 
         # column d is now okay, too
         self.assertEqual([res.feature_name for res in ca._results], ['a', 'b', 'c', 'd', 'f', 'g', 'h'])
+
+    def test_individualized_policy(self):
+        y = pd.Series(np.random.choice([0, 1], size=(500,)))
+        X = pd.DataFrame({'a': np.random.normal(size=500),
+                          'b': np.random.normal(size=500),
+                          'c': np.random.choice([0, 1], size=500),
+                          'd': np.random.choice(['a', 'b', 'c'], size=500)})
+        inds = ['a', 'b', 'c', 'd']
+        cats = ['c', 'd']
+        hinds = ['a', 'd']
+
+        ca = CausalAnalysis(inds, cats, hinds, heterogeneity_model='linear')
+        ca.fit(X, y)
+        df = ca.individualized_policy(X, 'a')
+        self.assertEqual(df.shape[0], 500)  # all rows included by default
+        self.assertEqual(df.shape[1], 4 + X.shape[1] - 1)  # new cols for policy, effect, upper and lower bounds
+        df = ca.individualized_policy(X, 'b', n_rows=5)
+        self.assertEqual(df.shape[0], 5)
+        self.assertEqual(df.shape[1], 4 + X.shape[1] - 1)  # new cols for policy, effect, upper and lower bounds
+        df = ca.individualized_policy(X, 'c', treatment_costs=100)
+        self.assertEqual(df.shape[0], 500)
+        self.assertEqual(df.shape[1], 4 + X.shape[1] - 1)  # new cols for policy, effect, upper and lower bounds
+        df = ca.individualized_policy(X, 'd', alpha=0.05)
+        self.assertEqual(df.shape[0], 500)
+        self.assertEqual(df.shape[1], 4 + X.shape[1] - 1)  # new cols for policy, effect, upper and lower bounds
+
+        dictionary = ca._individualized_policy_dict(X, 'a')

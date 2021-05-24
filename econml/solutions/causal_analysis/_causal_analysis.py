@@ -16,6 +16,7 @@ from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier,
 from sklearn.linear_model import Lasso, LassoCV, LogisticRegression, LogisticRegressionCV
 from sklearn.pipeline import make_pipeline, Pipeline
 from sklearn.preprocessing import OneHotEncoder, PolynomialFeatures, StandardScaler
+from sklearn.tree import _tree
 from sklearn.utils.validation import column_or_1d
 from ...cate_interpreter import SingleTreeCateInterpreter, SingleTreePolicyInterpreter
 from ...dml import LinearDML, CausalForestDML
@@ -214,11 +215,26 @@ def _sanitize(obj):
             raise ValueError(f"Could not sanitize input {obj}")
 
 
+# Convert SingleTreeInterpreter to a python dictionary
+def _tree_interpreter_to_dict(interp, features, leaf_data=lambda t, n: {}):
+    tree = interp.tree_model_.tree_
+
+    def recurse(node_id):
+        if tree.children_left[node_id] == _tree.TREE_LEAF:
+            return {'leaf': True, 'n_samples': tree.n_node_samples[node_id], **leaf_data(tree, node_id)}
+        else:
+            return {'leaf': False, 'feature': features[tree.feature[node_id]], 'threshold': tree.threshold[node_id],
+                    'left': recurse(tree.children_left[node_id]),
+                    'right': recurse(tree.children_right[node_id])}
+
+    return recurse(0)
+
+
 # named tuple type for storing results inside CausalAnalysis class;
 # must be lifted to module level to enable pickling
 _result = namedtuple("_result", field_names=[
     "feature_index", "feature_name", "feature_baseline", "feature_levels", "hinds",
-    "X_transformer", "W_transformer", "estimator", "global_inference"])
+    "X_transformer", "W_transformer", "estimator", "global_inference", "treatment_value"])
 
 
 class CausalAnalysis:
@@ -527,6 +543,7 @@ class CausalAnalysis:
                     _CausalInsightsConstants.EngineeredNameKey: [
                         f"{name} (base={baseline}): {c}" for c in cats]
                 }
+                treatment_value = 1
             else:
                 d_t = 1
                 cats = ["num"]
@@ -537,6 +554,9 @@ class CausalAnalysis:
                     _CausalInsightsConstants.CategoricalColumnKey: [name],
                     _CausalInsightsConstants.EngineeredNameKey: [name]
                 }
+                # calculate a "typical" treatment value, using the mean of the absolute value of non-zero treatments
+                treatment_value = np.mean(np.abs(T[T != 0]))
+
             result = _result(feature_index=feat_ind,
                              feature_name=name,
                              feature_baseline=baseline,
@@ -545,7 +565,8 @@ class CausalAnalysis:
                              X_transformer=X_transformer,
                              W_transformer=W_transformer,
                              estimator=est,
-                             global_inference=global_inference)
+                             global_inference=global_inference,
+                             treatment_value=treatment_value)
 
             return insights, result
 
@@ -892,30 +913,7 @@ class CausalAnalysis:
         (result,) = results
         return result
 
-    def whatif(self, X, Xnew, feature_index, y):
-        """
-        Get counterfactual predictions when feature_index is changed to Xnew from its observational counterpart.
-
-        Note that this only applies to regression use cases; for classification what-if analysis is not supported.
-
-        Parameters
-        ----------
-        X: array-like
-            Features
-        Xnew: array-like
-            New values of a single column of X
-        feature_index: int or string
-            The index of the feature being varied to Xnew, either as a numeric index or
-            the string name if the input is a dataframe
-        y: array-like
-            Observed labels or outcome of a predictive model for baseline y values
-
-        Returns
-        -------
-        y_new: InferenceResults
-            The predicted outputs that would have been observed under the counterfactual features
-        """
-
+    def _whatif_inference(self, X, Xnew, feature_index, y):
         assert not self.classification, "What-if analysis cannot be applied to classification tasks"
 
         assert np.shape(X)[0] == np.shape(Xnew)[0] == np.shape(y)[0], (
@@ -938,6 +936,34 @@ class CausalAnalysis:
 
         return inf
 
+    def whatif(self, X, Xnew, feature_index, y, *, alpha=0.1):
+        """
+        Get counterfactual predictions when feature_index is changed to Xnew from its observational counterpart.
+
+        Note that this only applies to regression use cases; for classification what-if analysis is not supported.
+
+        Parameters
+        ----------
+        X: array-like
+            Features
+        Xnew: array-like
+            New values of a single column of X
+        feature_index: int or string
+            The index of the feature being varied to Xnew, either as a numeric index or
+            the string name if the input is a dataframe
+        y: array-like
+            Observed labels or outcome of a predictive model for baseline y values
+        alpha : float in [0, 1], default 0.1
+            Confidence level of the confidence intervals displayed in the leaf nodes.
+            A (1-alpha)*100% confidence interval is displayed.
+
+        Returns
+        -------
+        y_new: DataFrame
+            The predicted outputs that would have been observed under the counterfactual features
+        """
+        return self._whatif_inference(X, Xnew, feature_index, y).summary_frame(alpha=alpha)
+
     def _whatif_dict(self, X, Xnew, feature_index, y, alpha=0.1):
         """
         Get counterfactual predictions when feature_index is changed to Xnew from its observational counterpart.
@@ -955,16 +981,16 @@ class CausalAnalysis:
             the string name if the input is a dataframe
         y: array-like
             Observed labels or outcome of a predictive model for baseline y values
-        alpha: float, default 0.1
-            The confidence level used for confidence intervals in the output
-
+        alpha : float in [0, 1], default 0.1
+            Confidence level of the confidence intervals displayed in the leaf nodes.
+            A (1-alpha)*100% confidence interval is displayed.
         Returns
         -------
         dict : dict
             The counterfactual predictions, as a dictionary
         """
 
-        inf = self.whatif(X, Xnew, feature_index, y)
+        inf = self._whatif_inference(X, Xnew, feature_index, y)
         props = self._point_props(alpha=alpha)
         res = _get_default_specific_insights('whatif')
         res.update([(key, self._make_accessor(attr)(inf).tolist()) for key, attr in props])
@@ -978,7 +1004,7 @@ class CausalAnalysis:
         if Xtest.shape[1] == 0:
             Xtest = None
         if result.feature_baseline is None:
-            treatment_names = ['low', 'high']
+            treatment_names = ['decrease', 'increase']
         else:
             treatment_names = [f"{result.feature_baseline}"] + \
                 [f"{lvl}" for lvl in result.feature_levels]
@@ -997,12 +1023,21 @@ class CausalAnalysis:
         if is_policy:
             intrp.interpret(result.estimator, Xtest,
                             sample_treatment_costs=treatment_cost)
-            treat = intrp.treat(Xtest)
-        else:  # no treatment cost for CATE trees
+            if result.feature_baseline is None:  # continuous treatment, so apply a treatment level 10% of typical
+                treatment_level = result.treatment_value * 0.1
+            else:
+                treatment_level = 1
+            # TODO: this calculation is correct only if treatment consts are marginal costs,
+            #       because then scaling the difference between treatment value and treatment costs is the
+            #       same as scaling the treatment value and subtracting the scaled treatment cost.
+            #       If treatment costs are absolute, then we'll need to modify the policy tree code itself to handle
+            #       treatment levels other than 1.
+            policy_values = intrp.policy_value_ * treatment_level, intrp.always_treat_value_ * treatment_level
+        else:  # no policy values for CATE trees
             intrp.interpret(result.estimator, Xtest)
-            treat = None
+            policy_values = None
 
-        return intrp, result.X_transformer.get_feature_names(self.feature_names_), treatment_names, treat
+        return intrp, result.X_transformer.get_feature_names(self.feature_names_), treatment_names, policy_values
 
     # TODO: it seems like it would be better to just return the tree itself rather than plot it;
     #       however, the tree can't store the feature and treatment names we compute here...
@@ -1042,7 +1077,7 @@ class CausalAnalysis:
         """
         Get a tuple policy outputs.
 
-        The first item in the tuple is the recommended policy tree in graphviz format as a string.
+        The first item in the tuple is the recommended policy tree expressed as a dictionary.
         The second item is the recommended treatment for each sample as a list.
 
         Parameters
@@ -1065,18 +1100,23 @@ class CausalAnalysis:
 
         Returns
         -------
-        tree : tuple of string, list of int
-            The policy tree represented as a graphviz string and the recommended treatment for each row
+        tree : tuple of string, float, float
+            The policy tree represented as a graphviz string,
+            the value of applying the recommended policy (over never treating),
+            the value of always treating (over never treating)
         """
 
-        intrp, feature_names, treatment_names, treat = self._tree(True, Xtest, feature_index,
-                                                                  treatment_cost=treatment_cost,
-                                                                  max_depth=max_depth,
-                                                                  min_samples_leaf=min_samples_leaf,
-                                                                  min_impurity_decrease=min_value_increase,
-                                                                  alpha=alpha)
-        return intrp.export_graphviz(feature_names=feature_names,
-                                     treatment_names=treatment_names), treat.tolist()
+        (intrp, feature_names, treatment_names,
+            (policy_val, always_trt)) = self._tree(True, Xtest, feature_index,
+                                                   treatment_cost=treatment_cost,
+                                                   max_depth=max_depth,
+                                                   min_samples_leaf=min_samples_leaf,
+                                                   min_impurity_decrease=min_value_increase,
+                                                   alpha=alpha)
+
+        def policy_data(tree, node_id):
+            return {'treatment': treatment_names[np.argmax(tree.value[node_id])]}
+        return _tree_interpreter_to_dict(intrp, feature_names, policy_data), policy_val, always_trt
 
     # TODO: it seems like it would be better to just return the tree itself rather than plot it;
     #       however, the tree can't store the feature and treatment names we compute here...
@@ -1112,11 +1152,11 @@ class CausalAnalysis:
         return intrp.plot(feature_names=feature_names,
                           treatment_names=treatment_names)
 
-    def _heterogeneity_tree_string(self, Xtest, feature_index, *,
+    def _heterogeneity_tree_output(self, Xtest, feature_index, *,
                                    max_depth=3, min_samples_leaf=2, min_impurity_decrease=1e-4,
                                    alpha=.1):
         """
-        Get an effect hetergoeneity tree in graphviz format as a string.
+        Get an effect heterogeneity tree expressed as a dictionary.
 
         Parameters
         ----------
@@ -1136,10 +1176,116 @@ class CausalAnalysis:
             A (1-alpha)*100% confidence interval is displayed.
         """
 
-        intrp, feature_names, treatment_names, _ = self._tree(False, Xtest, feature_index,
-                                                              max_depth=max_depth,
-                                                              min_samples_leaf=min_samples_leaf,
-                                                              min_impurity_decrease=min_impurity_decrease,
-                                                              alpha=alpha)
-        return intrp.export_graphviz(feature_names=feature_names,
-                                     treatment_names=treatment_names)
+        intrp, feature_names, _, _ = self._tree(False, Xtest, feature_index,
+                                                max_depth=max_depth,
+                                                min_samples_leaf=min_samples_leaf,
+                                                min_impurity_decrease=min_impurity_decrease,
+                                                alpha=alpha)
+
+        def hetero_data(tree, node_id):
+            return {'effect': _sanitize(tree.value[node_id])}
+        return _tree_interpreter_to_dict(intrp, feature_names, hetero_data)
+
+    def individualized_policy(self, Xtest, feature_index, *, n_rows=None, treatment_costs=0, alpha=0.1):
+        """
+        Get individualized treatment policy based on the learned model for a feature, sorted by the predicted effect.
+
+        Parameters
+        ----------
+        Xtest: array-like
+            Features
+        feature_index: int or string
+            Index of the feature to be considered as treatment
+        n_rows: int, optional
+            How many rows to return (all rows by default)
+        treatment_costs: array-like, default 0
+            Cost of treatment, as a scalar value or per-sample
+        alpha: float in [0, 1], default 0.1
+            Confidence level of the confidence intervals
+            A (1-alpha)*100% confidence interval is returned
+
+        Returns
+        -------
+        output: DataFrame
+            Dataframe containing recommended treatment, effect, confidence interval, sorted by effect
+        """
+        result = self._safe_result_index(Xtest, feature_index)
+
+        # get dataframe with all but selected column
+        orig_df = pd.DataFrame(Xtest, columns=self.feature_names_).drop(self.feature_names_[result.feature_index],
+                                                                        axis=1)
+
+        Xtest = result.X_transformer.transform(Xtest)
+        if Xtest.shape[1] == 0:
+            Xtest = None
+
+        effect = result.estimator.const_marginal_effect_inference(Xtest)
+        if result.feature_baseline is None:
+            # apply 10% of a typical treatment for this feature
+            effect.scale(result.treatment_value * 0.1)
+
+        effect.translate(-treatment_costs)
+
+        est = effect.point_estimate
+        est_lb = effect.conf_int(alpha)[0]
+        est_ub = effect.conf_int(alpha)[1]
+
+        if result.feature_baseline is None:
+            rec = np.empty(est.shape[0], dtype=object)
+            rec[est > 0] = "increase"
+            rec[est <= 0] = "decrease"
+            # set the effect bounds; for positive treatments these agree with
+            # the estimates; for negative treatments, we need to invert the interval
+            eff_lb, eff_ub = est_lb, est_ub
+            eff_lb[est <= 0], eff_ub[est <= 0] = -eff_ub[est <= 0], -eff_lb[est <= 0]
+            # the effect is now always positive since we decrease treatment when negative
+            eff = np.abs(est)
+        else:
+            # for discrete treatment, stack a zero result in front for control
+            zeros = np.zeros((est.shape[0], 1))
+            all_effs = np.hstack([zeros, est])
+            eff_ind = np.argmax(all_effs, axis=1)
+            all_eff_lbs = np.hstack([zeros, est_lb])
+            all_eff_ubs = np.hstack([zeros, est_ub])
+            treatment_arr = np.array([result.feature_baseline] + [lvl for lvl in result.feature_levels], dtype=object)
+            rec = treatment_arr[eff_ind]
+            eff_ind = eff_ind.reshape(-1, 1)
+            eff = np.take_along_axis(all_effs, eff_ind, 1).reshape(-1)
+            eff_lb = np.take_along_axis(all_eff_lbs, eff_ind, 1).reshape(-1)
+            eff_ub = np.take_along_axis(all_eff_ubs, eff_ind, 1).reshape(-1)
+
+        df = pd.DataFrame.from_dict({'Treatment': rec,
+                                     'Effect of treatment': eff,
+                                     'Effect of treatment lower bound': eff_lb,
+                                     'Effect of treatment upper bound': eff_ub})
+
+        return df.join(orig_df).sort_values('Effect of treatment',
+                                            ascending=False).head(n_rows)
+
+    def _individualized_policy_dict(self, Xtest, feature_index, *, n_rows=None, treatment_costs=0, alpha=0.1):
+        """
+        Get individualized treatment policy based on the learned model for a feature, sorted by the predicted effect.
+
+        Parameters
+        ----------
+        Xtest: array-like
+            Features
+        feature_index: int or string
+            Index of the feature to be considered as treatment
+        n_rows: int, optional
+            How many rows to return (all rows by default)
+        treatment_costs: array-like, default 0
+            Cost of treatment, as a scalar value or per-sample
+        alpha: float in [0, 1], default 0.1
+            Confidence level of the confidence intervals
+            A (1-alpha)*100% confidence interval is returned
+
+        Returns
+        -------
+        output: dictionary
+            dictionary containing treatment policy, effects, and other columns
+        """
+        return self.individualized_policy(Xtest, feature_index,
+                                          n_rows=n_rows,
+                                          treatment_costs=treatment_costs,
+                                          alpha=alpha).to_dict('list')
